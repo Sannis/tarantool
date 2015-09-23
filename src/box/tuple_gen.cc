@@ -39,10 +39,8 @@ tuple_cmp_t tuple_gen_compare(const struct key_def *def) {
 }
 
 tuple_cmp_wk_t tuple_gen_compare_with_key(const struct key_def *def) {
-
-	//if (def->part_count > 3)
+	if (def->part_count > 3)
 		return tuple_compare_with_key;
-
 	uint32_t cmp_id = 0;
 	for (uint32_t i = 0; i < def->part_count; i++)
 		cmp_id |= (def->parts[i].type == STRING) << i;

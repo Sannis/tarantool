@@ -27,7 +27,7 @@ tuple_bench(box_function_ctx_t *ctx, const char *args, const char *args_end)
 
 	char tuple_buf[4][64];
 	char *tuple_end[4] = {tuple_buf[0], tuple_buf[1], tuple_buf[2], tuple_buf[3]};
-	if(0) {
+	if(1) {
 		tuple_end[0] = mp_encode_array(tuple_end[0], 2);
 		tuple_end[0] = mp_encode_uint(tuple_end[0], 2);
 		tuple_end[0] = mp_encode_str(tuple_end[0], "bce", strlen("abb"));
@@ -43,7 +43,7 @@ tuple_bench(box_function_ctx_t *ctx, const char *args, const char *args_end)
 		tuple_end[3] = mp_encode_array(tuple_end[3], 2);
 		tuple_end[3] = mp_encode_uint(tuple_end[3], 3);
 		tuple_end[3] = mp_encode_str(tuple_end[3], "ccd", strlen("abb"));
-	} else if(1){
+	} else if(0){
 		tuple_end[0] = mp_encode_array(tuple_end[0], 1);
 		tuple_end[0] = mp_encode_uint(tuple_end[0], 2);
 
