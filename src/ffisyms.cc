@@ -21,6 +21,7 @@
 #include <lib/salad/guava.h>
 #include "latch.h"
 #include <lib/csv/csv.h>
+#include "coio.h"
 #include <box/memcached.h>
 
 /*
@@ -101,5 +102,10 @@ void *ffi_symbols[] = {
 	(void *) csv_iterator_create,
 	(void *) csv_next,
 	(void *) csv_feed,
-	(void *) memcached_set_listen,
+	(void *) memcached_start,
+	(void *) memcached_stop,
+	(void *) memcached_create,
+	(void *) memcached_free,
+	(void *) memcached_set_readahead,
+	(void *) memcached_get_stat,
 };

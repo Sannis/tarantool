@@ -122,7 +122,6 @@ class MemcachedException(Exception):
         self.size = size
 
 def construct_query(cmd, args):
-    print cmd, args
     assert(cmd in COMMANDS)
     op, struct, ext_len, key_len, val_len = COMMANDS[cmd]
     key     = args.get('key', '')
@@ -134,7 +133,6 @@ def construct_query(cmd, args):
     opaque  = args.get('opaque', 0)
     cas     = args.get('cas', 0)
     extra   = args.get('extra', [])
-    # print op, cmd, opaque
     retval = [
         struct.pack(MAGIC['request'], op, key_len,
                     ext_len, dtype, 0, tot_len,
@@ -147,16 +145,11 @@ def parse_query(cmd):
     to_read = HEADER_SIZE
     if len(cmd) < to_read:
         raise MemcachedException("Need more bytes", to_read - len(cmd))
-    # print len(cmd)
 
     a = (magic, op, key_len, ext_len, dtype,
      status, tot_len, opaque, cas) = HEADER_STRUCT.unpack_from(cmd)
-    # print "magic, op, key_len, ext_len, type, status, tot_len, opaque, cas"
-    # print a
     to_read += tot_len
     val_len = tot_len - key_len - ext_len
-    # print key_len, ext_len
-    # print val_len
 
     if len(cmd) < to_read:
         raise MemcachedException("Need more bytes", to_read - len(cmd))
@@ -165,10 +158,7 @@ def parse_query(cmd):
     # Multiple checks to be confident in server responses
     assert(magic == MAGIC['response'])
     if status == STATUS['OK']:
-        # print op, opaque
         assert(ext_len == ext_lenv)
-        print key_len, key_lenv
-        print val_len, val_lenv
         assert(((key_lenv > 0 or key_lenv is None) and key_len > 0) or key_len == 0)
         assert(((val_lenv > 0 or val_lenv is None) and val_len > 0) or val_len == 0)
     else:
@@ -192,7 +182,6 @@ def parse_query(cmd):
     if key_lenv is None:
         begin = HEADER_SIZE + ext_len
         end   = begin + key_len
-        # print begin, end
         key   = cmd[begin:end]
     if key is not None:
         retval['key'] = key
@@ -201,15 +190,13 @@ def parse_query(cmd):
     if val_lenv is None or val_len > 0:
         begin = HEADER_SIZE + ext_len + key_len
         end   = HEADER_SIZE + tot_len
-        # print begin, end
         val   = cmd[begin:end]
-        # decode result of incr(q)/decr(q)
+        # decode result of (incr/decr)(q)
         if is_indecrq(op):
             val = INDECR_STRUCT.unpack_from(val)[0]
     if val is not None:
         retval['val'] = val
 
-    print retval
     return retval
 
 class MemcachedBinaryConnection(TarantoolConnection):
@@ -229,9 +216,7 @@ class MemcachedBinaryConnection(TarantoolConnection):
 
     def _recv(self, to_read):
         buf = b""
-        # print to_read
         while to_read > 0:
-            # print to_read
             tmp = self.socket.recv(to_read)
             to_read -= len(tmp)
             buf += tmp
@@ -239,10 +224,7 @@ class MemcachedBinaryConnection(TarantoolConnection):
 
     def _read_response(self):
         hdr = self._recv(HEADER_SIZE)
-        # print len(hdr), HEADER_SIZE
         sz = hdr + self._recv(LENGTH_STRUCT.unpack_from(hdr)[0])
-        # print len(sz)
-        print repr(sz)
         return sz
 
     def _read_and_parse_response(self):
@@ -250,7 +232,6 @@ class MemcachedBinaryConnection(TarantoolConnection):
 
     def read_responses(self):
         resp = []
-        print "waiting ", self.latest
         while True:
             obj = self._read_and_parse_response()
             resp.append(obj)

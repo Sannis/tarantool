@@ -37,12 +37,15 @@
 #include "bit/bit.h"
 #include "session.h"
 #include "coio_buf.h"
+#include "scoped_guard.h"
 
 #include "memcached.h"
 #include "memcached_layer.h"
 
 static int
 memcached_process_request(struct memcached_connection *con) {
+	if (con->noprocess)
+		goto noprocess;
 	try {
 		/* Process message */
 		con->noreply = false;
@@ -54,35 +57,35 @@ memcached_process_request(struct memcached_connection *con) {
 		case (MEMCACHED_BIN_CMD_ADD):
 		case (MEMCACHED_BIN_CMD_SET):
 		case (MEMCACHED_BIN_CMD_REPLACE):
-			mc_process_set(con);
+			memcached_process_set(con);
 			break;
 		case (MEMCACHED_BIN_CMD_GETQ):
 		case (MEMCACHED_BIN_CMD_GETKQ):
 			con->noreply = true;
 		case (MEMCACHED_BIN_CMD_GET):
 		case (MEMCACHED_BIN_CMD_GETK):
-			mc_process_get(con);
+			memcached_process_get(con);
 			break;
 		case (MEMCACHED_BIN_CMD_DELETEQ):
 			con->noreply = true;
 		case (MEMCACHED_BIN_CMD_DELETE):
-			mc_process_del(con);
+			memcached_process_del(con);
 			break;
 		case (MEMCACHED_BIN_CMD_NOOP):
-			mc_process_nop(con);
+			memcached_process_nop(con);
 			break;
 		case (MEMCACHED_BIN_CMD_QUITQ):
 			con->noreply = true;
 		case (MEMCACHED_BIN_CMD_QUIT):
-			mc_process_quit(con);
+			memcached_process_quit(con);
 			break;
 		case (MEMCACHED_BIN_CMD_FLUSHQ):
 			con->noreply = true;
 		case (MEMCACHED_BIN_CMD_FLUSH):
-			mc_process_flush(con);
+			memcached_process_flush(con);
 			break;
 		case (MEMCACHED_BIN_CMD_STAT):
-			mc_process_stats(con);
+			memcached_process_stats(con);
 			break;
 		case (MEMCACHED_BIN_CMD_GATQ):
 		case (MEMCACHED_BIN_CMD_GATKQ):
@@ -90,31 +93,75 @@ memcached_process_request(struct memcached_connection *con) {
 		case (MEMCACHED_BIN_CMD_GAT):
 		case (MEMCACHED_BIN_CMD_GATK):
 		case (MEMCACHED_BIN_CMD_TOUCH):
-			mc_process_gat(con);
+			memcached_process_gat(con);
 			break;
 		case (MEMCACHED_BIN_CMD_VERSION):
-			mc_process_version(con);
+			memcached_process_version(con);
 			break;
 		case (MEMCACHED_BIN_CMD_INCRQ):
 		case (MEMCACHED_BIN_CMD_DECRQ):
 			con->noreply = true;
 		case (MEMCACHED_BIN_CMD_INCR):
 		case (MEMCACHED_BIN_CMD_DECR):
-			mc_process_delta(con);
+			memcached_process_delta(con);
 			break;
 		case (MEMCACHED_BIN_CMD_APPENDQ):
 		case (MEMCACHED_BIN_CMD_PREPENDQ):
 			con->noreply = true;
 		case (MEMCACHED_BIN_CMD_APPEND):
 		case (MEMCACHED_BIN_CMD_PREPEND):
-			mc_process_pend(con);
+			memcached_process_pend(con);
 			break;
-		default:
-			assert(false);
+		case (MEMCACHED_BIN_CMD_SASL_LIST_MECHS):
+		case (MEMCACHED_BIN_CMD_SASL_AUTH):
+		case (MEMCACHED_BIN_CMD_SASL_STEP):
+		case (MEMCACHED_BIN_CMD_RGET):
+		case (MEMCACHED_BIN_CMD_RSETQ):
+		case (MEMCACHED_BIN_CMD_RSET):
+		case (MEMCACHED_BIN_CMD_RAPPENDQ):
+		case (MEMCACHED_BIN_CMD_RAPPEND):
+		case (MEMCACHED_BIN_CMD_RPREPENDQ):
+		case (MEMCACHED_BIN_CMD_RPREPEND):
+		case (MEMCACHED_BIN_CMD_RDELETEQ):
+		case (MEMCACHED_BIN_CMD_RDELETE):
+		case (MEMCACHED_BIN_CMD_RINCRQ):
+		case (MEMCACHED_BIN_CMD_RINCR):
+		case (MEMCACHED_BIN_CMD_RDECRQ):
+		case (MEMCACHED_BIN_CMD_RDECR): {
+			char errstr[257];
+			size_t errlen = snprintf(errstr, 256,
+				"Unsupported command '%s'",
+				memcached_get_command_name(con->hdr->cmd)
+			); (void )errlen;
+			memcached_process_error(con,
+						MEMCACHED_BIN_RES_NOT_SUPPORTED,
+						errstr);
+			say_error((const char *)errstr, 1);
+			}
+		default: {
+			char errstr[257];
+			size_t errlen = snprintf(errstr, 256,
+				"Unknown command with opcode '%.2X'",
+				con->hdr->cmd
+			); (void )errlen;
+			memcached_process_error(con,
+						MEMCACHED_BIN_RES_NOT_SUPPORTED,
+						errstr);
+			say_error((const char *)errstr, 1);
+			}
 		}
 	} catch (Exception *e) {
-		// memcached_reply_error(out, e, msg->hdr->opaque);
+		char errstr[257];
+		size_t errlen = snprintf(errstr, 256,
+			"Unsupported command '%s'",
+			memcached_get_command_name(con->hdr->cmd)
+		); (void )errlen;
+		memcached_process_error(con, MEMCACHED_BIN_RES_SERVER_ERROR,
+					e->errmsg());
+		e->log();
+		throw;
 	}
+noprocess:
 	con->write_end = obuf_create_svp(&con->iobuf->out);
 	con->iobuf->in.rpos += con->len;
 	return 0;
@@ -122,6 +169,7 @@ memcached_process_request(struct memcached_connection *con) {
 
 static int
 memcached_parse_request(struct memcached_connection *con) {
+	struct obuf *out     = &con->iobuf->out; (void )out;
 	struct ibuf *in      = &con->iobuf->in;
 	const char *reqstart = in->rpos;
 	/* Check that we have enough data for header */
@@ -134,8 +182,8 @@ memcached_parse_request(struct memcached_connection *con) {
 		say_error("Wrong magic, closing connection");
 		return -1;
 	}
-	const char *reqend = reqstart + sizeof(struct memcached_hdr) +
-			     bswap_u32(hdr->tot_len);
+	uint32_t tot_len = bswap_u32(hdr->tot_len);
+	const char *reqend = reqstart + sizeof(struct memcached_hdr) + tot_len;
 	/* Check that we have enough data for body */
 	if (reqend > in->wpos) {
 		return (reqend - in->wpos);
@@ -144,7 +192,7 @@ memcached_parse_request(struct memcached_connection *con) {
 	hdr->tot_len = bswap_u32(hdr->tot_len);
 	hdr->opaque  = bswap_u32(hdr->opaque);
 	hdr->cas     = bswap_u64(hdr->cas);
-	con->hdr = hdr;
+	con->hdr     = hdr;
 	const char *pos = reqstart + sizeof(struct memcached_hdr);
 	if ((con->body.ext_len = hdr->ext_len)) {
 		con->body.ext = pos;
@@ -167,6 +215,13 @@ memcached_parse_request(struct memcached_connection *con) {
 	}
 	con->len = sizeof(struct memcached_hdr) + hdr->tot_len;
 	assert(pos == reqend);
+	if (tot_len > 1<<20) {
+		memcached_process_error(con, MEMCACHED_BIN_RES_E2BIG,
+					NULL);
+		say_error("Object is too big for cache");
+		con->noprocess = true;
+		return 0;
+	}
 	return 0;
 }
 
@@ -180,7 +235,7 @@ memcached_flush(struct memcached_connection *con) {
 	if (ibuf_used(&iobuf->in) == 0)
 		ibuf_reset(&iobuf->in);
 	obuf_reset(&iobuf->out);
-	// ibuf_reserve(&iobuf->in, cfg->readahead);
+	ibuf_reserve(&iobuf->in, con->cfg->readahead);
 	return total;
 }
 
@@ -195,13 +250,15 @@ memcached_loop(struct memcached_connection *con)
 
 	for (;;) {
 		ssize_t read = coio_bread(coio, in, to_read);
-		if (read <= 0) return;
+		if (read <= 0)
+			break;
+		con->cfg->stat.bytes_read += read;
 		to_read = 1;
 next:
 		rc = memcached_parse_request(con);
-		if (rc < 0) {
+		if (rc == -1) {
 			/* We close connection, because of wrong magic */
-			return;
+			break;
 		} else if (rc > 0) {
 			to_read = rc;
 			continue;
@@ -213,7 +270,7 @@ next:
 		rc = memcached_process_request(con);
 		if (rc < 0 || con->close_connection) {
 			say_debug("Requesting exit. Exiting.");
-			return;
+			break;
 		} else if (rc > 0) {
 			to_read = rc;
 			continue;
@@ -222,18 +279,24 @@ next:
 			goto next;
 		}
 		/* Write back answer */
-		if (!con->noreply) memcached_flush(con);
+		if (!con->noreply) {
+			ssize_t written = memcached_flush(con);
+			con->cfg->stat.bytes_written += written;
+		}
+		fiber_gc();
+		con->noreply = false;
+		con->noprocess = false;
 	}
 }
 
 static void
 memcached_handler(va_list ap)
 {
-	struct ev_io     coio    = va_arg(ap, struct ev_io);
-	struct sockaddr *addr    = va_arg(ap, struct sockaddr *);
-	socklen_t        addrlen = va_arg(ap, socklen_t); (void )addrlen;
-	struct iobuf    *iobuf   = va_arg(ap, struct iobuf *);
-	struct memcached_pair *p = va_arg(ap, struct memcached_pair *);
+	struct ev_io     coio       = va_arg(ap, struct ev_io);
+	struct sockaddr *addr       = va_arg(ap, struct sockaddr *);
+	socklen_t        addr_len   = va_arg(ap, socklen_t);
+	struct iobuf    *iobuf      = va_arg(ap, struct iobuf *);
+	struct memcached_service *p = va_arg(ap, struct memcached_service *);
 
 	struct memcached_connection con;
 	/* TODO: move to connection_init */
@@ -241,22 +304,78 @@ memcached_handler(va_list ap)
 	con.coio      = &coio;
 	con.iobuf     = iobuf;
 	con.write_end = obuf_create_svp(&iobuf->out);
-	con.cookie    = *(uint64_t *) addr;
-	con.session   = session_create(con.coio->fd, con.cookie);
-	con.cfg       = p->cfg;
-	con.stat      = p->stat;
+	con.addr      = *addr;
+	con.addr_len  = addr_len;
+	con.session   = session_create(con.coio->fd, *(uint64_t *)&con.addr);
+	con.cfg       = p;
 
 	/* read-write cycle */
-	memcached_loop(&con);
+	con.cfg->stat.curr_conns++;
+	con.cfg->stat.total_conns++;
+	con.cfg->stat.started = fiber_time64();
+	try {
+		auto scoped_guard = make_scoped_guard([&] {
+			fiber_sleep(0.01);
+			con.cfg->stat.curr_conns--;
+			evio_close(loop(), &coio);
+			iobuf_delete(iobuf);
+		});
+
+		memcached_loop(&con);
+		memcached_flush(&con);
+	} catch (const FiberCancelException& e) {
+		throw;
+	} catch (const Exception& e) {
+		e.log();
+	}
+}
+
+struct memcached_service*
+memcached_create(const char *name, uint32_t sid)
+{
+	struct memcached_service *srv = (struct memcached_service *)calloc(1,
+			sizeof(struct memcached_service));
+	if (!srv) {
+		panic("failed to allocate memory for memcached service");
+		return NULL;
+	}
+	srv->space_id = sid;
+	srv->name = name;
+	return srv;
 }
 
 void
-memcached_set_listen(const char *name, const char *uri,
-		     struct memcached_pair *pair)
+memcached_free(struct memcached_service *srv)
 {
-	/* TODO: move to internal alloc */
-	struct coio_service *mc_service = (struct coio_service *)
-			calloc(1, sizeof(struct coio_service));
-	coio_service_init(mc_service, name, memcached_handler, pair);
-	coio_service_start((struct evio_service *)mc_service, uri);
+	if (srv) free(srv);
+}
+
+void
+memcached_start (struct memcached_service *srv, const char *uri)
+{
+	srv->uri = uri;
+	coio_service_init(&(srv->service), srv->name, memcached_handler, srv);
+	coio_service_start((struct evio_service *)&(srv->service), srv->uri);
+}
+
+void
+memcached_stop (struct memcached_service *srv)
+{
+	(void )srv;
+	// evio_close(loop(), &(srv->service));
+}
+
+/*
+void
+memcached_gc ()
+*/
+
+void memcached_set_readahead (struct memcached_service *srv, int readahead)
+{
+	srv->readahead = readahead;
+}
+
+struct memcached_stat *memcached_get_stat (struct memcached_service *srv)
+{
+	return &(srv->stat);
 }

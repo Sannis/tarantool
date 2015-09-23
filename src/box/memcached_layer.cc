@@ -27,7 +27,9 @@
 
 #define xisspace(c) isspace((unsigned char)c)
 
-bool safe_strtoull(const char *begin, const char *end, uint64_t *out) {
+bool
+safe_strtoull(const char *begin, const char *end, uint64_t *out)
+{
 	assert(out != NULL);
 	errno = 0;
 	*out = 0;
@@ -57,10 +59,12 @@ bool safe_strtoull(const char *begin, const char *end, uint64_t *out) {
  * default exptime is 30*24*60*60 seconds
  * \* 1000000 to convert it to usec (need this precision)
  **/
-#define DEFAULT_EXPTIME (30*24*60*60*1000000LL)
+#define MAX_EXPTIME (30*24*60*60*1000000LL)
+#define INF_EXPTIME UINT64_MAX
 
 static __attribute__((unused)) void
-memcached_dump_hdr(struct memcached_hdr *hdr) {
+memcached_dump_hdr(struct memcached_hdr *hdr)
+{
 	if (!hdr) return;
 	say_debug("memcached package");
 	say_debug("magic:     0x%" PRIX8,        hdr->magic);
@@ -75,48 +79,43 @@ memcached_dump_hdr(struct memcached_hdr *hdr) {
 }
 
 static inline uint64_t
-get_current_time() {
-	return fiber_time64();
-}
-
-static inline uint64_t
-convert_exptime (uint64_t exptime) {
-	if (exptime == 0) return 0; /* 0 means never expire */
-	if (exptime < DEFAULT_EXPTIME)
-		return get_current_time() + exptime * 1000000;
-	return exptime * 1000000;
+convert_exptime (uint64_t exptime)
+{
+	if (exptime == 0)
+		return INF_EXPTIME; /* 0 means never expire */
+	if (exptime <= MAX_EXPTIME)
+		exptime = fiber_time64() + exptime * 1000000;
+	else
+		exptime = exptime * 1000000;
+	return exptime;
 }
 
 static inline int
-is_expired (const char *key, uint32_t key_len,
-	    uint64_t exptime, uint64_t time, uint64_t flush) {
+is_expired (uint64_t exptime, uint64_t time, uint64_t flush)
+{
 	(void )time;
-	uint64_t curtime = get_current_time();
+	uint64_t curtime = fiber_time64();
 	/* Expired by flush */
 	if (flush <= curtime && time <= flush) {
-		say_debug("key '%.*s' expired by flush", key_len, key);
-		say_debug("flush time %lu, current time %lu, time of creation %lu",
-			 flush, curtime, time);
 		return 1;
 	}
 	/* Expired by TTL */
-	if (exptime != 0 && exptime < curtime) {
-		say_debug("key '%.*s' expired by expire", key_len, key);
-		say_debug("exptime is %lu, current time %lu",
-			 exptime, curtime);
+	if (exptime <= curtime) {
 		return 1;
 	}
 	return 0;
 }
 
 static inline int
-is_expired_tuple(box_tuple_t *tuple, uint64_t flush) {
+is_expired_tuple(box_tuple_t *tuple, uint64_t flush)
+{
 	const char *pos  = box_tuple_field(tuple, 0);
 	uint32_t key_len = 0;
 	const char *key  = mp_decode_str(&pos, &key_len);
+	(void )key; (void )key_len;
 	uint64_t exptime = mp_decode_uint(&pos);
 	uint64_t time    = mp_decode_uint(&pos);
-	return is_expired(key, key_len, exptime, time, flush);
+	return is_expired(exptime, time, flush);
 }
 
 /* This function swaps byte order, so ... */
@@ -125,7 +124,8 @@ write_output(struct obuf *out, struct memcached_hdr *hdri,
 	     uint16_t err, uint64_t cas,
 	     uint8_t ext_len, uint16_t key_len, uint32_t val_len,
 	     const char *ext, const char *key, const char *val
-	     ) {
+	     )
+{
 	struct memcached_hdr hdro;
 	memcpy(&hdro, hdri, sizeof(struct memcached_hdr));
 	hdro.magic   = MEMCACHED_BIN_RESPONSE;
@@ -142,11 +142,11 @@ write_output(struct obuf *out, struct memcached_hdr *hdri,
 }
 
 static int
-mc_insert_tuple(const char *kpos, uint32_t klen, uint64_t expire,
-		const char *vpos, uint32_t vlen, uint64_t cas,
-		uint32_t flags, uint32_t spaceid)
+memcached_insert_tuple(const char *kpos, uint32_t klen, uint64_t expire,
+		       const char *vpos, uint32_t vlen, uint64_t cas,
+		       uint32_t flags, uint32_t space_id)
 {
-	uint64_t time = get_current_time();
+	uint64_t time = fiber_time64();
 	uint32_t len = mp_sizeof_array(6)      +
 		       mp_sizeof_str  (klen)   +
 		       mp_sizeof_uint (expire) +
@@ -164,12 +164,15 @@ mc_insert_tuple(const char *kpos, uint32_t klen, uint64_t expire,
 	end = mp_encode_uint (end, cas);
 	end = mp_encode_uint (end, flags);
 	assert(end <= begin + len);
-	return box_replace(spaceid, begin, end, NULL);
+	return box_replace(space_id, begin, end, NULL);
 }
 
-static void
-mc_process_error(struct obuf *out, struct memcached_hdr *hdr,
-		 uint16_t err, const char *errstr) {
+void
+memcached_process_error(struct memcached_connection *con,
+			uint16_t err, const char *errstr)
+{
+	struct obuf *out  = &con->iobuf->out;
+	struct memcached_hdr *hdr = con->hdr;
 	if (!errstr) {
 		switch (err) {
 		case MEMCACHED_BIN_RES_ENOMEM:
@@ -210,8 +213,8 @@ mc_process_error(struct obuf *out, struct memcached_hdr *hdr,
 	write_output(out, hdr, err, 0, 0, 0, len, NULL, NULL, errstr);
 }
 
-static void
-mc_process_internal_error(struct obuf *out, struct memcached_hdr *hdr) {
+void
+memcached_process_internal_error(struct memcached_connection *con) {
 	const box_error_t *err = box_error_last();
 	uint16_t       errcode = box_error_code(err);
 	const char     *errstr = box_error_message(err);
@@ -231,7 +234,7 @@ mc_process_internal_error(struct obuf *out, struct memcached_hdr *hdr) {
 	default:
 		break;
 	}
-	mc_process_error(out, hdr, errcode, errstr);
+	memcached_process_error(con, errcode, errstr);
 }
 
 /*
@@ -245,7 +248,7 @@ mc_process_internal_error(struct obuf *out, struct memcached_hdr *hdr) {
  * - flags
  */
 void
-mc_process_set(struct memcached_connection *con)
+memcached_process_set(struct memcached_connection *con)
 {
 	/* default declarations */
 	struct memcached_hdr  *h = con->hdr;
@@ -255,7 +258,7 @@ mc_process_set(struct memcached_connection *con)
 	if (b->ext == NULL || b->key == NULL || b->val == NULL) {
 		say_error("problem while parsing package '%s'"
 			  " with opaque %" PRIu32,
-			  mc_get_command_name(h->cmd), h->opaque);
+			  memcached_get_command_name(h->cmd), h->opaque);
 		if (b->ext == 0) say_error("package has no ext");
 		if (b->ext_len != sizeof(struct memcached_set_ext)){
 			say_error("ext length differs, expected %zu, get %u",
@@ -264,11 +267,12 @@ mc_process_set(struct memcached_connection *con)
 		if (b->key == 0) say_error("package has no key");
 		if (b->val == 0) say_error("package has no val");
 		con->close_connection = true;
-		return mc_process_error(out, h, MEMCACHED_BIN_RES_EINVAL, NULL);
+		return memcached_process_error(con, MEMCACHED_BIN_RES_EINVAL,
+					       NULL);
 	}
-	say_debug("%s '%.*s' '%.*s'", mc_get_command_name(h->cmd), b->key_len,
+	say_debug("%s '%.*s' '%.*s'", memcached_get_command_name(h->cmd), b->key_len,
 		  b->key, b->val_len, b->val);
-	con->stat->cmd_set++;
+	con->cfg->stat.cmd_set++;
 	struct memcached_set_ext *ext = (struct memcached_set_ext *)b->ext;
 	ext->flags = bswap_u32(ext->flags);
 	uint64_t exptime = convert_exptime(bswap_u32(ext->expire));
@@ -277,43 +281,43 @@ mc_process_set(struct memcached_connection *con)
 		       mp_sizeof_str  (b->key_len);
 	char *begin  = (char *) region_alloc(&fiber()->gc, len);
 	char *end = NULL;
-	assert(end <= begin + len);
-	box_tuple_t *tuple = NULL;
 	end = mp_encode_array(begin, 1);
 	end = mp_encode_str  (end, b->key, b->key_len);
+	box_tuple_t *tuple = NULL;
 	assert(end <= begin + len);
-	if (box_index_get(con->cfg->spaceid, 0, begin, end, &tuple) == -1) {
-		return mc_process_internal_error(out, h);
+	if (box_index_get(con->cfg->space_id, 0, begin, end, &tuple) == -1) {
+		return memcached_process_internal_error(con);
 	}
 	if (h->cmd == MEMCACHED_BIN_CMD_REPLACE &&
 			(tuple == NULL || is_expired_tuple(tuple, con->cfg->flush))) {
-		return mc_process_error(out, h,
-				MEMCACHED_BIN_RES_KEY_ENOENT, NULL);
+		return memcached_process_error(con,
+					       MEMCACHED_BIN_RES_KEY_ENOENT,
+					       NULL);
 	} else if (h->cmd == MEMCACHED_BIN_CMD_ADD &&
 			!(tuple == NULL || is_expired_tuple(tuple, con->cfg->flush))) {
-		return mc_process_error(out, h,
+		return memcached_process_error(con,
 				MEMCACHED_BIN_RES_KEY_EEXISTS, NULL);
 	} else if (h->cas != 0) {
 		if (!tuple || is_expired_tuple(tuple, con->cfg->flush)) {
-			con->stat->cas_misses++;
+			con->cfg->stat.cas_misses++;
 			say_debug("CAS is there, but no tuple");
-			return mc_process_error(out, h,
+			return memcached_process_error(con,
 				MEMCACHED_BIN_RES_KEY_ENOENT, NULL);
 		} else if (tuple) {
-			con->stat->cas_badval++;
+			con->cfg->stat.cas_badval++;
 			const char *pos   = box_tuple_field(tuple, 4);
 			uint64_t cas_prev = mp_decode_uint(&pos);
 			if (cas_prev != h->cas) {
 				say_debug("CAS is there, tuple is there, no match");
-				return mc_process_error(out, h,
+				return memcached_process_error(con,
 					MEMCACHED_BIN_RES_KEY_EEXISTS, NULL);
 			}
 		}
-		con->stat->cas_hits++;
+		con->cfg->stat.cas_hits++;
 	}
-	if (mc_insert_tuple(b->key, b->key_len, exptime, b->val, b->val_len,
-			    cas, ext->flags, con->cfg->spaceid) == -1) {
-		mc_process_internal_error(out, h);
+	if (memcached_insert_tuple(b->key, b->key_len, exptime, b->val, b->val_len,
+			    cas, ext->flags, con->cfg->space_id) == -1) {
+		memcached_process_internal_error(con);
 	} else {
 		if (!con->noreply) {
 			write_output(out, h, MEMCACHED_BIN_RES_OK, cas, 0, 0,
@@ -323,7 +327,7 @@ mc_process_set(struct memcached_connection *con)
 }
 
 void
-mc_process_get(struct memcached_connection *con)
+memcached_process_get(struct memcached_connection *con)
 {
 	/* default declarations */
 	struct memcached_hdr  *h = con->hdr;
@@ -333,15 +337,16 @@ mc_process_get(struct memcached_connection *con)
 	if (b->ext != NULL || b->key == NULL || b->val != NULL) {
 		say_error("problem while parsing package '%s'"
 			  " with opaque %" PRIu32,
-			  mc_get_command_name(h->cmd), h->opaque);
+			  memcached_get_command_name(h->cmd), h->opaque);
 		if (b->ext != 0) say_error("package has ext");
 		if (b->key == 0) say_error("package has no key");
 		if (b->val != 0) say_error("package has val");
 		con->close_connection = true;
-		return mc_process_error(out, h, MEMCACHED_BIN_RES_EINVAL, NULL);
+		return memcached_process_error(con, MEMCACHED_BIN_RES_EINVAL,
+					       NULL);
 	}
-	con->stat->cmd_get++;
-	say_debug("%s '%.*s'", mc_get_command_name(h->cmd), b->key_len, b->key);
+	con->cfg->stat.cmd_get++;
+	say_debug("%s '%.*s'", memcached_get_command_name(h->cmd), b->key_len, b->key);
 	uint32_t len = mp_sizeof_array(1) +
 		       mp_sizeof_str  (b->key_len);
 	char *begin = (char *) region_alloc(&fiber()->gc, len);
@@ -349,8 +354,8 @@ mc_process_get(struct memcached_connection *con)
 	      end   = mp_encode_str  (end, b->key, b->key_len);
 	assert(end <= begin + len);
 	box_tuple_t *tuple = NULL;
-	if (box_index_get(con->cfg->spaceid, 0, begin, end, &tuple) == -1) {
-		mc_process_internal_error(out, h);
+	if (box_index_get(con->cfg->space_id, 0, begin, end, &tuple) == -1) {
+		memcached_process_internal_error(con);
 	} else if (tuple != NULL && !is_expired_tuple(tuple, con->cfg->flush)) {
 		struct memcached_get_ext ext;
 		uint32_t vlen = 0, klen = 0;
@@ -369,18 +374,18 @@ mc_process_get(struct memcached_connection *con)
 		write_output(out, h, MEMCACHED_BIN_RES_OK, cas,
 			     sizeof(struct memcached_get_ext), 0, vlen,
 			     (const char *)&ext, kpos, vpos);
-		con->stat->get_hits++;
+		con->cfg->stat.get_hits++;
 	} else {
-		con->stat->get_misses++;
+		con->cfg->stat.get_misses++;
 		if (!con->noreply) {
-			mc_process_error(out, h, MEMCACHED_BIN_RES_KEY_ENOENT,
-					 NULL);
+			memcached_process_error(con, MEMCACHED_BIN_RES_KEY_ENOENT,
+					        NULL);
 		}
 	}
 }
 
 void
-mc_process_del(struct memcached_connection *con)
+memcached_process_del(struct memcached_connection *con)
 {
 	/* default declarations */
 	struct memcached_hdr  *h = con->hdr;
@@ -390,14 +395,15 @@ mc_process_del(struct memcached_connection *con)
 	if (b->ext != NULL || b->key == NULL || b->val != NULL) {
 		say_error("problem while parsing package '%s'"
 			  " with opaque %" PRIu32,
-			  mc_get_command_name(h->cmd), h->opaque);
+			  memcached_get_command_name(h->cmd), h->opaque);
 		if (b->ext != 0) say_error("package has ext");
 		if (b->key == 0) say_error("package has no key");
 		if (b->val != 0) say_error("package has val");
 		con->close_connection = true;
-		return mc_process_error(out, h, MEMCACHED_BIN_RES_EINVAL, NULL);
+		return memcached_process_error(con, MEMCACHED_BIN_RES_EINVAL,
+					       NULL);
 	}
-	con->stat->cmd_delete++;
+	con->cfg->stat.cmd_delete++;
 	uint32_t len = mp_sizeof_array(1) +
 		       mp_sizeof_str  (b->key_len);
 	char *begin = (char *) region_alloc(&fiber()->gc, len);
@@ -405,22 +411,22 @@ mc_process_del(struct memcached_connection *con)
 	      end   = mp_encode_str  (end, b->key, b->key_len);
 	assert(end <= begin + len);
 	box_tuple_t *tuple = NULL;
-	if (box_delete(con->cfg->spaceid, 0, begin, end, &tuple) == -1) {
-		mc_process_internal_error(out, h);
+	if (box_delete(con->cfg->space_id, 0, begin, end, &tuple) == -1) {
+		memcached_process_internal_error(con);
 	} else if (tuple != NULL) {
-		con->stat->delete_hits++;
+		con->cfg->stat.delete_hits++;
 		if (!con->noreply) {
 			write_output(out, h, MEMCACHED_BIN_RES_OK, 0, 0, 0, 0,
 				     NULL, NULL, NULL);
 		}
 	} else {
-		con->stat->delete_misses++;
-		mc_process_error(out, h, MEMCACHED_BIN_RES_KEY_ENOENT, NULL);
+		con->cfg->stat.delete_misses++;
+		memcached_process_error(con, MEMCACHED_BIN_RES_KEY_ENOENT, NULL);
 	}
 }
 
 void
-mc_process_version(struct memcached_connection *con)
+memcached_process_version(struct memcached_connection *con)
 {
 	/* default declarations */
 	struct memcached_hdr  *h = con->hdr;
@@ -430,12 +436,12 @@ mc_process_version(struct memcached_connection *con)
 	if (b->ext != NULL || b->key != NULL || b->val != NULL) {
 		say_error("problem while parsing package '%s'"
 			  " with opaque %" PRIu32,
-			  mc_get_command_name(h->cmd), h->opaque);
+			  memcached_get_command_name(h->cmd), h->opaque);
 		if (b->ext != 0) say_error("package has ext");
 		if (b->key != 0) say_error("package has key");
 		if (b->val != 0) say_error("package has val");
 		con->close_connection = true;
-		return mc_process_error(out, h, MEMCACHED_BIN_RES_EINVAL, NULL);
+		return memcached_process_error(con, MEMCACHED_BIN_RES_EINVAL, NULL);
 	}
 	const char *vers = tarantool_version();
 	int vlen = strlen(vers);
@@ -446,7 +452,7 @@ mc_process_version(struct memcached_connection *con)
 }
 
 void
-mc_process_nop(struct memcached_connection *con)
+memcached_process_nop(struct memcached_connection *con)
 {
 	/* default declarations */
 	struct memcached_hdr  *h = con->hdr;
@@ -456,12 +462,12 @@ mc_process_nop(struct memcached_connection *con)
 	if (b->ext != NULL || b->key != NULL || b->val != NULL) {
 		say_error("problem while parsing package '%s'"
 			  " with opaque %" PRIu32,
-			  mc_get_command_name(h->cmd), h->opaque);
+			  memcached_get_command_name(h->cmd), h->opaque);
 		if (b->ext != 0) say_error("package has ext");
 		if (b->key != 0) say_error("package has key");
 		if (b->val != 0) say_error("package has val");
 		con->close_connection = true;
-		return mc_process_error(out, h, MEMCACHED_BIN_RES_EINVAL, NULL);
+		return memcached_process_error(con, MEMCACHED_BIN_RES_EINVAL, NULL);
 	}
 	if (!con->noreply) {
 		write_output(out, h, MEMCACHED_BIN_RES_OK, 0, 0, 0, 0, NULL,
@@ -470,7 +476,7 @@ mc_process_nop(struct memcached_connection *con)
 }
 
 void
-mc_process_flush(struct memcached_connection *con)
+memcached_process_flush(struct memcached_connection *con)
 {
 	/* default declarations */
 	struct memcached_hdr  *h = con->hdr;
@@ -480,7 +486,7 @@ mc_process_flush(struct memcached_connection *con)
 	if (b->key != NULL || b->val != NULL) {
 		say_error("problem while parsing package '%s'"
 			  " with opaque %" PRIu32,
-			  mc_get_command_name(h->cmd), h->opaque);
+			  memcached_get_command_name(h->cmd), h->opaque);
 		if (b->ext && b->ext_len != sizeof(struct memcached_flush_ext)) {
 			say_error("ext length differs, expected %zu, get %u",
 				  sizeof(struct memcached_flush_ext), b->ext_len);
@@ -488,13 +494,15 @@ mc_process_flush(struct memcached_connection *con)
 		if (b->key != 0) say_error("package has key");
 		if (b->val != 0) say_error("package has val");
 		con->close_connection = true;
-		return mc_process_error(out, h, MEMCACHED_BIN_RES_EINVAL, NULL);
+		return memcached_process_error(con, MEMCACHED_BIN_RES_EINVAL, NULL);
 	}
-	con->stat->cmd_flush++;
+	con->cfg->stat.cmd_flush++;
 	struct memcached_flush_ext *ext = (struct memcached_flush_ext *)b->ext;
 	uint64_t exptime = 0;
-	if (ext != NULL) exptime = convert_exptime(bswap_u32(ext->expire));
-	con->cfg->flush = (exptime > 0 ? exptime : get_current_time());
+	con->cfg->flush = fiber_time64();
+	if (ext != NULL)
+		exptime = bswap_u32(ext->expire);
+	if (exptime > 0) con->cfg->flush = convert_exptime(exptime);
 	if (!con->noreply) {
 		write_output(out, h, MEMCACHED_BIN_RES_OK, 0, 0, 0, 0, NULL,
 			     NULL, NULL);
@@ -502,7 +510,7 @@ mc_process_flush(struct memcached_connection *con)
 }
 
 void
-mc_process_gat(struct memcached_connection *con)
+memcached_process_gat(struct memcached_connection *con)
 {
 	/* default declarations */
 	struct memcached_hdr  *h = con->hdr;
@@ -512,7 +520,7 @@ mc_process_gat(struct memcached_connection *con)
 	if (b->ext == NULL || b->key == NULL || b->val != NULL) {
 		say_error("problem while parsing package '%s'"
 			  " with opaque %" PRIu32,
-			  mc_get_command_name(h->cmd), h->opaque);
+			  memcached_get_command_name(h->cmd), h->opaque);
 		if (b->ext == 0) say_error("package has no ext");
 		if (b->ext_len != sizeof(struct memcached_touch_ext)) {
 			say_error("ext length differs, expected %zu, get %u",
@@ -521,12 +529,12 @@ mc_process_gat(struct memcached_connection *con)
 		if (b->key == 0) say_error("package has no key");
 		if (b->val != 0) say_error("package has val");
 		con->close_connection = true;
-		return mc_process_error(out, h, MEMCACHED_BIN_RES_EINVAL, NULL);
+		return memcached_process_error(con, MEMCACHED_BIN_RES_EINVAL, NULL);
 	}
-	con->stat->cmd_touch++;
+	con->cfg->stat.cmd_touch++;
 	struct memcached_touch_ext *ext = (struct memcached_touch_ext *)b->ext;
 	uint64_t exptime = convert_exptime(bswap_u32(ext->expire));
-	uint64_t current = get_current_time();
+	uint64_t current = fiber_time64();
 
 	uint32_t len  = mp_sizeof_array (2)   +
 			mp_sizeof_array (3)   +
@@ -559,24 +567,22 @@ mc_process_gat(struct memcached_connection *con)
 	assert(end <= begin + len);
 
 	box_tuple_t *tuple = NULL;
-	if (box_index_get(con->cfg->spaceid, 0, key, end, &tuple) == -1) {
-		say_info("error here");
-		return mc_process_internal_error(out, h);
+	if (box_index_get(con->cfg->space_id, 0, key, end, &tuple) == -1) {
+		return memcached_process_internal_error(con);
 	} else if (tuple == NULL || is_expired_tuple(tuple, con->cfg->flush)) {
-		con->stat->touch_misses++;
+		con->cfg->stat.touch_misses++;
 		if (!con->noreply) {
-			mc_process_error(out, h,
-					MEMCACHED_BIN_RES_KEY_ENOENT, NULL);
+			memcached_process_error(con, MEMCACHED_BIN_RES_KEY_ENOENT,
+					        NULL);
 		}
 		return;
 	}
-	con->stat->touch_hits++;
+	con->cfg->stat.touch_hits++;
 
 	/* Tuple can't be NULL, because we already found this element */
-	if (box_update(con->cfg->spaceid, 0, key, end,
+	if (box_update(con->cfg->space_id, 0, key, end,
 		       begin, key, 0, &tuple) == -1) {
-		say_info("or there");
-		mc_process_internal_error(out, h);
+		memcached_process_internal_error(con);
 	} else {
 		uint32_t vlen = 0, klen = 0, elen = 0;
 		const char *kpos = NULL, *vpos = NULL;
@@ -587,7 +593,6 @@ mc_process_gat(struct memcached_connection *con)
 			kpos = mp_decode_str(&pos, &klen);
 			mp_next(&pos); mp_next(&pos);
 			vpos = mp_decode_str(&pos, &vlen);
-			say_info("%.*s", vlen, vpos);
 			cas = mp_decode_uint(&pos);
 			flags = mp_decode_uint(&pos);
 			epos = (struct memcached_get_ext *)&flags;
@@ -606,7 +611,7 @@ mc_process_gat(struct memcached_connection *con)
 }
 
 void
-mc_process_delta(struct memcached_connection *con)
+memcached_process_delta(struct memcached_connection *con)
 {
 	/* default declarations */
 	struct memcached_hdr  *h = con->hdr;
@@ -616,7 +621,7 @@ mc_process_delta(struct memcached_connection *con)
 	if (b->ext == NULL || b->key == NULL || b->val != NULL) {
 		say_error("problem while parsing package '%s'"
 			  " with opaque %" PRIu32,
-			  mc_get_command_name(h->cmd), h->opaque);
+			  memcached_get_command_name(h->cmd), h->opaque);
 		if (b->ext == 0) say_error("package has no ext");
 		if (b->ext_len != sizeof(struct memcached_delta_ext)) {
 			say_error("ext length differs, expected %zu, get %u",
@@ -625,14 +630,15 @@ mc_process_delta(struct memcached_connection *con)
 		if (b->key == 0) say_error("package has no key");
 		if (b->val != 0) say_error("package has val");
 		con->close_connection = true;
-		return mc_process_error(out, h, MEMCACHED_BIN_RES_EINVAL, NULL);
+		return memcached_process_error(con, MEMCACHED_BIN_RES_EINVAL,
+					       NULL);
 	}
 	struct memcached_delta_ext *ext = (struct memcached_delta_ext *)b->ext;
 	ext->expire  = bswap_u32(ext->expire);
 	ext->delta   = bswap_u64(ext->delta);
 	ext->initial = bswap_u64(ext->initial);
-	say_debug("%s '%.*s' by %lu", mc_get_command_name(h->cmd), b->key_len,
-		 b->key, ext->delta);
+	say_debug("%s '%.*s' by %lu", memcached_get_command_name(h->cmd),
+		  b->key_len, b->key, ext->delta);
 	uint32_t len = mp_sizeof_array(1) +
 		       mp_sizeof_str  (b->key_len);
 	char *begin = (char *) region_alloc(&fiber()->gc, len);
@@ -645,52 +651,48 @@ mc_process_delta(struct memcached_connection *con)
 	const char *vpos = NULL;
 	uint32_t    vlen = 0;
 	char        strval[22]; uint8_t strvallen = 0;
-	if (box_index_get(con->cfg->spaceid, 0, begin, end, &tuple) == -1) {
-		return mc_process_internal_error(out, h);
+	if (box_index_get(con->cfg->space_id, 0, begin, end, &tuple) == -1) {
+		return memcached_process_internal_error(con);
 	} else if (tuple == NULL || is_expired_tuple(tuple, con->cfg->flush)) {
 		if (ext->expire == 0xFFFFFFFFLL) {
-			return mc_process_error(out, h,
+			return memcached_process_error(con,
 					MEMCACHED_BIN_RES_KEY_ENOENT, NULL);
 		} else {
-			ext->expire = 0;
+			uint64_t expire = convert_exptime(ext->expire);
 			val = ext->initial;
 			/* Insert value */
 			strvallen = snprintf(strval, 21, "%lu", val);
-			int retval = mc_insert_tuple(b->key, b->key_len,
-					ext->expire, (const char *)strval,
-					strvallen, cas, 0, con->cfg->spaceid);
+			int retval = memcached_insert_tuple(b->key, b->key_len,
+					expire, (const char *)strval,
+					strvallen, cas, 0, con->cfg->space_id);
 			if (retval == -1) {
-				return mc_process_internal_error(out, h);
+				return memcached_process_internal_error(con);
 			}
 		}
 	} else {
-		if (ext->expire == 0xFFFFFFFFLL)
-			ext->expire = 0;
+		uint64_t expire = convert_exptime(ext->expire);
 		const char *pos = box_tuple_field(tuple, 0);
 		mp_next(&pos); mp_next(&pos); mp_next(&pos);
 		vpos = mp_decode_str(&pos, &vlen);
-		say_debug("value before '%.*s', %lu", vlen, vpos, val);
 		if (!safe_strtoull(vpos, vpos + vlen, &val)) {
-			say_debug("ERROR DELTA_BADVAL");
-			return mc_process_error(out, h,
+			say_error("ERROR DELTA_BADVAL");
+			return memcached_process_error(con,
 					MEMCACHED_BIN_RES_DELTA_BADVAL, NULL);
 		}
 		if (h->cmd == MEMCACHED_BIN_CMD_INCR ||
 		    h->cmd == MEMCACHED_BIN_CMD_INCRQ) {
 			val += ext->delta;
 		} else if (ext->delta > val) {
-			say_debug("becoming null");
 			val = 0;
 		} else {
 			val -= ext->delta;
 		}
-		say_debug("value after %lu", val);
 		/* Insert value */
 		strvallen = snprintf(strval, 21, "%lu", val);
-		if (mc_insert_tuple(b->key, b->key_len,
-				ext->expire, (const char *)strval,
-				strvallen, cas, 0, con->cfg->spaceid) == -1) {
-			return mc_process_internal_error(out, h);
+		if (memcached_insert_tuple(b->key, b->key_len,
+				expire, (const char *)strval,
+				strvallen, cas, 0, con->cfg->space_id) == -1) {
+			return memcached_process_internal_error(con);
 		}
 	}
 	/* Send response */
@@ -702,7 +704,7 @@ mc_process_delta(struct memcached_connection *con)
 }
 
 void
-mc_process_pend(struct memcached_connection *con)
+memcached_process_pend(struct memcached_connection *con)
 {
 	/* default declarations */
 	struct memcached_hdr  *h = con->hdr;
@@ -712,14 +714,14 @@ mc_process_pend(struct memcached_connection *con)
 	if (b->ext != NULL || b->key == NULL || b->val == NULL) {
 		say_error("problem while parsing package '%s'"
 			  " with opaque %" PRIu32,
-			  mc_get_command_name(h->cmd), h->opaque);
+			  memcached_get_command_name(h->cmd), h->opaque);
 		if (b->ext != 0) say_error("package has ext");
 		if (b->key == 0) say_error("package has no key");
 		if (b->val == 0) say_error("package has no val");
 		con->close_connection = true;
-		return mc_process_error(out, h, MEMCACHED_BIN_RES_EINVAL, NULL);
+		return memcached_process_error(con, MEMCACHED_BIN_RES_EINVAL, NULL);
 	}
-	con->stat->cmd_set++;
+	con->cfg->stat.cmd_set++;
 	uint64_t cas = con->cfg->cas++;
 	uint32_t len  = mp_sizeof_array (2)      +
 			/* splice (app/prepend) operation */
@@ -765,17 +767,17 @@ mc_process_pend(struct memcached_connection *con)
 	assert(end <= begin + len);
 
 	box_tuple_t *tuple = NULL;
-	if (box_index_get(con->cfg->spaceid, 0, key, end, &tuple) == -1) {
-		return mc_process_internal_error(out, h);
+	if (box_index_get(con->cfg->space_id, 0, key, end, &tuple) == -1) {
+		return memcached_process_internal_error(con);
 	} else if (tuple == NULL || is_expired_tuple(tuple, con->cfg->flush)) {
-		return mc_process_error(out, h, MEMCACHED_BIN_RES_KEY_ENOENT,
+		return memcached_process_error(con, MEMCACHED_BIN_RES_KEY_ENOENT,
 		       NULL);
 	}
 
 	/* Tuple can't be NULL, because we already found this element */
-	if (box_update(con->cfg->spaceid, 0, key,
+	if (box_update(con->cfg->space_id, 0, key,
 		       end, begin, key, 0, &tuple) == -1) {
-		mc_process_internal_error(out, h);
+		memcached_process_internal_error(con);
 	} else {
 		if (!con->noreply) {
 			write_output(out, h, MEMCACHED_BIN_RES_OK, cas,
@@ -786,7 +788,7 @@ mc_process_pend(struct memcached_connection *con)
 }
 
 void
-mc_process_quit(struct memcached_connection *con)
+memcached_process_quit(struct memcached_connection *con)
 {
 	/* default declarations */
 	struct memcached_hdr  *h = con->hdr;
@@ -797,11 +799,11 @@ mc_process_quit(struct memcached_connection *con)
 	if (b->ext != NULL || b->key != NULL || b->val != NULL) {
 		say_error("problem while parsing package '%s'"
 			  " with opaque %" PRIu32,
-			  mc_get_command_name(h->cmd), h->opaque);
+			  memcached_get_command_name(h->cmd), h->opaque);
 		if (b->ext != 0) say_error("package has ext");
 		if (b->key != 0) say_error("package has key");
 		if (b->val != 0) say_error("package has val");
-		return mc_process_error(out, h, MEMCACHED_BIN_RES_EINVAL, NULL);
+		return memcached_process_error(con, MEMCACHED_BIN_RES_EINVAL, NULL);
 	}
 	if (!con->noreply) {
 		write_output(out, h, MEMCACHED_BIN_RES_OK, 0, 0, 0, 0, NULL,
@@ -821,7 +823,7 @@ void stat_append(struct memcached_connection *con,
 };
 
 void
-mc_process_stats(struct memcached_connection *con)
+memcached_process_stats(struct memcached_connection *con)
 {
 	/* server specific data */
 	stat_append(con, "pid", "%d", getpid());
@@ -832,26 +834,26 @@ mc_process_stats(struct memcached_connection *con)
 	stat_append(con, "pointer_size", "%d", (int )(8 * sizeof(void *)));
 
 	/* storage specific data */
-	stat_append(con, "cmd_get",       "%lu", con->stat->cmd_get);
-	stat_append(con, "get_hits",      "%lu", con->stat->get_hits);
-	stat_append(con, "get_misses",    "%lu", con->stat->get_misses);
-	stat_append(con, "cmd_set",       "%lu", con->stat->cmd_set);
-	stat_append(con, "cas_hits",      "%lu", con->stat->cas_hits);
-	stat_append(con, "cas_badval",    "%lu", con->stat->cas_badval);
-	stat_append(con, "cas_misses",    "%lu", con->stat->cas_misses);
-	stat_append(con, "cmd_delete",    "%lu", con->stat->cmd_delete);
-	stat_append(con, "delete_hits",   "%lu", con->stat->delete_hits);
-	stat_append(con, "delete_misses", "%lu", con->stat->delete_misses);
-	stat_append(con, "cmd_incr",      "%lu", con->stat->cmd_incr);
-	stat_append(con, "incr_hits",     "%lu", con->stat->incr_hits);
-	stat_append(con, "incr_misses",   "%lu", con->stat->incr_misses);
-	stat_append(con, "cmd_decr",      "%lu", con->stat->cmd_decr);
-	stat_append(con, "decr_hits",     "%lu", con->stat->decr_hits);
-	stat_append(con, "decr_misses",   "%lu", con->stat->decr_misses);
-	stat_append(con, "cmd_flush",     "%lu", con->stat->cmd_flush);
-	stat_append(con, "cmd_touch",     "%lu", con->stat->cmd_touch);
-	stat_append(con, "touch_hits",    "%lu", con->stat->touch_hits);
-	stat_append(con, "touch_misses",  "%lu", con->stat->touch_misses);
+	stat_append(con, "cmd_get",       "%lu", con->cfg->stat.cmd_get);
+	stat_append(con, "get_hits",      "%lu", con->cfg->stat.get_hits);
+	stat_append(con, "get_misses",    "%lu", con->cfg->stat.get_misses);
+	stat_append(con, "cmd_set",       "%lu", con->cfg->stat.cmd_set);
+	stat_append(con, "cas_hits",      "%lu", con->cfg->stat.cas_hits);
+	stat_append(con, "cas_badval",    "%lu", con->cfg->stat.cas_badval);
+	stat_append(con, "cas_misses",    "%lu", con->cfg->stat.cas_misses);
+	stat_append(con, "cmd_delete",    "%lu", con->cfg->stat.cmd_delete);
+	stat_append(con, "delete_hits",   "%lu", con->cfg->stat.delete_hits);
+	stat_append(con, "delete_misses", "%lu", con->cfg->stat.delete_misses);
+	stat_append(con, "cmd_incr",      "%lu", con->cfg->stat.cmd_incr);
+	stat_append(con, "incr_hits",     "%lu", con->cfg->stat.incr_hits);
+	stat_append(con, "incr_misses",   "%lu", con->cfg->stat.incr_misses);
+	stat_append(con, "cmd_decr",      "%lu", con->cfg->stat.cmd_decr);
+	stat_append(con, "decr_hits",     "%lu", con->cfg->stat.decr_hits);
+	stat_append(con, "decr_misses",   "%lu", con->cfg->stat.decr_misses);
+	stat_append(con, "cmd_flush",     "%lu", con->cfg->stat.cmd_flush);
+	stat_append(con, "cmd_touch",     "%lu", con->cfg->stat.cmd_touch);
+	stat_append(con, "touch_hits",    "%lu", con->cfg->stat.touch_hits);
+	stat_append(con, "touch_misses",  "%lu", con->cfg->stat.touch_misses);
 	/* finish */
 	stat_append(con, "", "");
 }

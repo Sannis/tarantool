@@ -58,12 +58,13 @@ print("""
 #-----------------------------------------------------------------------------#
 """)
 
-# # Toobig tests
-# empty("toobig")
-# mc.set("toobig", "not too big", 10, 10)
-# res = mc.set("toobig", "x" * 1024*1024*2, 10, 10);
-# print(res[0]["status"] == STATUS["E2BIG"])
-# empty("toobig")
+# Toobig tests
+empty("toobig")
+mc.set("toobig", "not too big", 10, 10)
+val = "x" * 1024*1024*2
+res = mc.set("toobig", val, 10, 10);
+print(res[0]["status"] == STATUS["E2BIG"])
+check("toobig", 10, "not too big")
 
 print("""
 #-----------------------------------------------------------------------------#
@@ -275,10 +276,11 @@ mc.prependq(key, prefix, nosend=True)
 check_empty_response(mc)
 check(key, 19, prefix + value)
 
-print("""#---------------------# test protocol boundary overruns #---------------------#""")
-
-from pprint import pprint
-pprint(mc.stat())
+# print("""#---------------------# test protocol boundary overruns #---------------------#""")
+#
+# import time
+# from pprint import pprint
+# pprint(mc.stat())
 
 # for i in range(1900, 2100):
 #     print ("iteration I: %d" % i)
@@ -288,7 +290,7 @@ pprint(mc.stat())
 #     mc.setq("alt_%s" % key, "blah", flags=82, nosend=True)
 #     data = "".join(mc.commands)
 #     mc.commands = []
-# 
+#
 #     if (len(data) > 2024):
 #         for j in range(2024, min(2096, len(data))):
 #             mc.socket.sendall(data[:j])

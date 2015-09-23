@@ -125,7 +125,7 @@ enum memcached_binary_cmd {
 extern const char *memcached_binary_cmd_name[];
 
 static inline const char *
-mc_get_command_name(uint32_t op) {
+memcached_get_command_name(uint32_t op) {
 	if (op >= MEMCACHED_BIN_CMD_MAX)
 		return "UNKNOWN";
 	return memcached_binary_cmd_name[op];
@@ -182,7 +182,7 @@ struct memcached_touch_ext {
 struct memcached_body {
 	uint8_t     ext_len;
 	uint16_t    key_len;
-	uint16_t    val_len;
+	uint32_t    val_len;
 	const void *ext;
 	const char *key;
 	const char *val;

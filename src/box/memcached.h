@@ -11,56 +11,20 @@
 
 #include "memcached_constants.h"
 
-void
-memcached_init();
+#if defined(__cplusplus)
+extern "C" {
+#endif /* defined(__cplusplus) */
 
-extern "C" void
-memcached_set_listen(const char *name, const char *uri,
-		     struct memcached_pair *pair);
-
-/**
- * Single connection object, handles information about
- * 1) pointer to memcached stats
- * 2) pointer to memcached config
- * 3) connection data, that's created by coio
- * 4) internal tarantool session for access limitations
- * 4) last decoded memcached message (we can do it since memcached
- * 				      binary proto is synchronious)
- */
-struct memcached_connection {
-	/* memcached_specific data */
-	struct memcached_stats *stat;
-	struct memcached_cfg   *cfg;
-	/* connection data */
-	struct ev_io   *coio;
-	struct iobuf   *iobuf;
-	struct obuf_svp write_end;
-	bool            noreply;
-	bool            close_connection;
-	/* session data */
-	uint64_t        cookie;
-	struct session *session;
-	/* request data */
-	struct memcached_hdr *hdr;
-	struct memcached_body body;
-	size_t                len;
-};
-
-struct memcached_cfg {
-	uint32_t spaceid;
-	uint64_t cas;
-	bool     flush_enabled;
-	uint64_t flush;
-};
-
-struct memcached_stats {
+struct memcached_stat {
+	/* connection informations */
 	unsigned int  curr_items;
 	unsigned int  total_items;
 	unsigned int  curr_conns;
 	unsigned int  total_conns;
 	uint64_t      bytes_read;
 	uint64_t      bytes_written;
-	time_t        started;          /* when the process was started */
+	/* time when process was started */
+	time_t        started;
 	/* get statistics */
 	uint64_t      cmd_get;
 	uint64_t      get_hits;
@@ -94,9 +58,61 @@ struct memcached_stats {
 	uint64_t      auth_errors;
 };
 
-struct memcached_pair {
-	struct memcached_cfg   *cfg;
-	struct memcached_stats *stat;
+struct memcached_service {
+	struct coio_service   service;
+	/* configurable */
+	const char           *uri;
+	const char           *name;
+	uint32_t              space_id;
+	int                   readahead;
+	/* properties */
+	uint64_t              cas;
+	uint64_t              flush;
+	struct memcached_stat stat;
 };
+
+/**
+ * Single connection object, handles information about
+ * 1) pointer to memcached stats
+ * 2) pointer to memcached config
+ * 3) connection data, that's created by coio
+ * 4) internal tarantool session for access limitations
+ * 4) last decoded memcached message (we can do it since memcached
+ * 				      binary proto is synchronious)
+ */
+struct memcached_connection {
+	/* memcached_specific data */
+	struct memcached_service *cfg;
+	/* connection data */
+	struct ev_io             *coio;
+	struct iobuf             *iobuf;
+	struct obuf_svp           write_end;
+	bool                      noreply;
+	bool                      close_connection;
+	bool                      noprocess;
+	/* session data */
+	union {
+		struct sockaddr addr;
+		struct sockaddr_storage addrstorage;
+	};
+	socklen_t addr_len;
+	struct session           *session;
+	/* request data */
+	struct memcached_hdr     *hdr;
+	struct memcached_body     body;
+	size_t                    len;
+};
+
+void              memcached_set_readahead (struct memcached_service *, int);
+struct memcached_stat *memcached_get_stat (struct memcached_service *);
+
+struct memcached_service* memcached_create(const char *, uint32_t);
+void memcached_start (struct memcached_service *, const char *);
+void memcached_stop  (struct memcached_service *);
+void memcached_free  (struct memcached_service *);
+
+#if defined(__cplusplus)
+}
+#endif /* defined(__cplusplus) */
 
 #endif

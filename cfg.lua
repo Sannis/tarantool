@@ -5,7 +5,7 @@ box.cfg{
 
 require('console').listen(3302)
 local mc = require('memcached')
-mc.start{
+local inst = mc.create{
     name = 'memcached'
 }
 
