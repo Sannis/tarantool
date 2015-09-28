@@ -31,14 +31,59 @@
 #include "tuple_gen.h"
 #include "tuple.h"
 
-#include "third_party/tuple-cmp/tuple_compare_generated.h"
+#include "third_party/tuple-cmp/tuple_compare_macro.h"
 
-tuple_cmp_t tuple_gen_compare(const struct key_def *def) {
-	(void)def;
-	return tuple_compare;
+/** comparator special for NUM key with fieldno == 0 */
+int
+tuple_compare_n_first(const struct tuple *tuple_a, const struct tuple *tuple_b,
+		       const struct key_def *)
+{
+	const char *a = tuple_a->data;
+	const char *b = tuple_b->data;
+	mp_decode_array(&a);
+	mp_decode_array(&b);
+	return mp_compare_uint(a, b);
 }
 
-tuple_cmp_wk_t tuple_gen_compare_with_key(const struct key_def *def) {
+/** comparator special for STR key with fieldno == 0 */
+int
+tuple_compare_s_first(const struct tuple *tuple_a, const struct tuple *tuple_b,
+		       const struct key_def *)
+{
+	int r;
+	const char *field_a = tuple_a->data;
+	const char *field_b = tuple_b->data;
+	mp_decode_array(&field_a);
+	mp_decode_array(&field_b);
+	uint32_t size_a = mp_decode_strl(&field_a);
+	uint32_t size_b = mp_decode_strl(&field_b);
+	r = memcmp(field_a, field_b, MIN(size_a, size_b));
+	if (r == 0)
+		r = size_a < size_b ? -1 : size_a > size_b;
+	return r;
+}
+
+const tuple_cmp_t tuple_compare_arr_first[2] = {
+	tuple_compare_n_first,
+	tuple_compare_s_first
+};
+
+tuple_cmp_t
+tuple_gen_compare(const struct key_def *def) {
+	if (def->part_count > 3)
+		return tuple_compare;
+	uint32_t cmp_id = 0;
+	for (uint32_t i = 0; i < def->part_count; i++)
+		cmp_id |= (def->parts[i].type == STRING) << i;
+
+	if (def->part_count == 1 && def->parts[0].fieldno == 0)
+		return tuple_compare_arr_first[cmp_id];
+
+	return tuple_compare_arr[def->part_count][cmp_id];
+}
+
+tuple_cmp_wk_t
+tuple_gen_compare_with_key(const struct key_def *def) {
 	if (def->part_count > 3)
 		return tuple_compare_with_key;
 	uint32_t cmp_id = 0;
